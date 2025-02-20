@@ -1,0 +1,85 @@
+#!/bin/bash
+# Check if kubectl and jq are installed
+if ! command -v kubectl &> /dev/null; then
+    echo "kubectl is not installed. Please install kubectl first."
+    exit 1
+fi
+if ! command -v jq &> /dev/null; then
+    echo "jq is not installed. Please install jq first."
+    exit 1
+fi
+# Get the names of all nodes
+nodes=$(kubectl get nodes -o json | jq -r '.items[].metadata.name')
+# Initialize statistical variables
+idle_nodes=0
+total_idle_cpu=0
+total_idle_gpu=0
+# Print the table header, ensuring alignment between header and data
+printf "%-25s %-10s %-25s %-15s\n" "Node" "CPU" "Mem" "GPU"
+# Iterate through each node to retrieve its resource usage
+for node in $nodes; do
+    # Get the list of Pods on the node, considering only running Pods
+    pods=$(kubectl get pods --all-namespaces --field-selector spec.nodeName=$node,status.phase=Running -o json)
+    # Check if there are any Pods; if not, initialize requests to 0
+    if [[ $(echo $pods | jq '.items | length') -eq 0 ]]; then
+        cpu_requests=0
+        memory_requests=0
+        gpu_requests=0
+    else
+        # Calculate CPU requests, handling null values
+        cpu_requests=$(echo $pods | jq '[.items[].spec.containers[].resources.requests.cpu | tonumber? // 0] | add')
+        # Calculate memory requests (convert to Mi), handling null values
+        memory_requests=$(echo $pods | jq '
+            [.items[].spec.containers[].resources.requests.memory |
+                if . == null then 0
+                elif test("^[0-9]+(Ki|Mi|Gi)$") then
+                    capture("(?<num>[0-9]+)(?<unit>.*)") |
+                    if .unit == "Gi" then (.num | tonumber) * 1024
+                    elif .unit == "Mi" then (.num | tonumber)
+                    elif .unit == "Ki" then (.num | tonumber) / 1024
+                    else 0 end
+                else 0 end] | add')
+        # Assuming GPU resource name is "nvidia.com/gpu", calculate GPU requests, handling null values
+        gpu_requests=$(echo $pods | jq '[.items[].spec.containers[].resources.requests."nvidia.com/gpu" | tonumber? // 0] | add')
+    fi
+    # Get the node's resource limits (from the allocatable field)
+    node_info=$(kubectl get node $node -o json)
+    
+    # Get CPU limits
+    cpu_limits=$(echo $node_info | jq '.status.allocatable.cpu | tonumber')
+    # Get memory limits and convert to Mi, handling null values
+    memory_limits=$(echo $node_info | jq '
+        .status.allocatable.memory |
+        if . == null then 0
+        elif test("^[0-9]+(Ki|Mi|Gi)$") then
+            capture("(?<num>[0-9]+)(?<unit>.*)") |
+            if .unit == "Gi" then (.num | tonumber) * 1024
+            elif .unit == "Mi" then (.num | tonumber)
+            elif .unit == "Ki" then (.num | tonumber) / 1024
+            else 0 end
+        else 0 end')
+    # Get GPU limits, handling null values
+    gpu_limits=$(echo $node_info | jq '.status.allocatable."nvidia.com/gpu" | tonumber? // 0')
+    # Calculate idle resources (CPU and GPU as integers, memory in Mi)
+    idle_cpu=$((cpu_limits - cpu_requests))
+    idle_memory=$((memory_limits - memory_requests))
+    idle_gpu=$((gpu_limits - gpu_requests))
+    # Accumulate idle resources into statistical variables
+    total_idle_cpu=$((total_idle_cpu + idle_cpu))
+    total_idle_gpu=$((total_idle_gpu + idle_gpu))
+    # If idle GPU is greater than 0, consider the node as an idle node
+    if ((idle_gpu > 0)); then
+        idle_nodes=$((idle_nodes + 1))
+    fi
+    # Format output, combining requests and limits as "requests/limits", memory displayed in Gi
+    printf "%-25s %-10s %-25s %-15s\n" "$node" \
+        "${cpu_requests}/${cpu_limits}" \
+        "$(printf "%.2fGi/%.2fGi" $((memory_requests / 1024)) $((memory_limits / 1024)))" \
+        "${gpu_requests}/${gpu_limits}"
+done
+# Output statistics
+echo ""
+echo "Statistics:"
+printf "Idle nodes: %d\n" "$idle_nodes"
+printf "Total idle CPU: %d\n" "$total_idle_cpu"
+printf "Total idle GPU: %d\n" "$total_idle_gpu"

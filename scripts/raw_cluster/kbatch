@@ -1,0 +1,193 @@
+#!/bin/bash
+# kbatch: Submit a job with specified resources for distributed training
+
+# Cluster configuration variables (can be modified as needed)
+MAX_GPUS_PER_NODE=8            # Maximum GPUs allowed per node
+CPUS_PER_GPU=$(( (128 - 64) / MAX_GPUS_PER_NODE ))  # CPUs per GPU
+MEMORY_PER_GPU=$(( (920 - 460) / MAX_GPUS_PER_NODE ))  # Memory per GPU in GiB
+SHARED_MEM_PER_GPU=10          # Shared memory per GPU in GiB
+MASTER_PORT=12345      # Default port for PyTorch master communication
+JOB_RECORD_FILE="~/job_records.csv"  # File to record job submissions
+IMAGE_NAME="nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04"  # Docker image for the job
+SHARED_VOLUME_PATH="/mnt/shared_volume"  # Path to shared volume on host
+
+# Default values
+NODES=1
+GPUS_PER_NODE=1
+SCRIPT=""
+OUTPUT_DIR=""
+
+usage() {
+    echo "Usage: kbatch [options] <script.sh>"
+    echo "Options:"
+    echo "  --nodes=<num_nodes>         Number of nodes (default: 1)"
+    echo "  --gpus=<num_gpus_per_node>  Number of GPUs per node (default: 1)"
+    echo "  --output-dir=<output_dir>   Directory to store job logs (optional)"
+    exit 1
+}
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --nodes=*)
+            NODES="${1#*=}"
+            shift
+            ;;
+        --gpus=*)
+            GPUS_PER_NODE="${1#*=}"
+            shift
+            ;;
+        --output-dir=*)
+            OUTPUT_DIR="${1#*=}"
+            shift
+            ;;
+        -*)
+            echo "Error: Unknown option '$1'"
+            usage
+            ;;
+        *)
+            SCRIPT="$1"
+            shift
+            break
+            ;;
+    esac
+done
+
+# Validate script argument
+if [[ -z "$SCRIPT" || ! -f "$SCRIPT" ]]; then
+    echo "Error: Job script not provided or not found."
+    usage
+fi
+
+# Validate input
+if (( NODES < 1 || GPUS_PER_NODE < 1 )); then
+    echo "Error: Nodes and GPUs per node must be >= 1."
+    usage
+fi
+
+# Check resource limits
+if (( GPUS_PER_NODE > MAX_GPUS_PER_NODE )); then
+    echo "Error: GPUs per node cannot exceed $MAX_GPUS_PER_NODE."
+    usage
+fi
+
+# Calculate total resources
+MEMORY_PER_NODE=$(( GPUS_PER_NODE * MEMORY_PER_GPU ))Gi
+SHARED_MEM_PER_NODE=$(( GPUS_PER_NODE * SHARED_MEM_PER_GPU ))Gi
+
+# Generate a unique job ID
+if [[ ! -f "$JOB_RECORD_FILE" ]]; then
+    # Create the CSV file with headers if it doesn't exist
+    echo "jobid,submit_time,script_path" > "$JOB_RECORD_FILE"
+fi
+
+# Read the last job ID from the CSV file
+if [[ -s "$JOB_RECORD_FILE" ]]; then
+    LAST_JOBID=$(tail -n 1 "$JOB_RECORD_FILE" | cut -d',' -f1 | grep -Eo '[0-9]+')
+    LAST_JOBID=${LAST_JOBID:-0}
+else
+    LAST_JOBID=0
+fi
+JOB_ID=$(( LAST_JOBID + 1 ))
+JOB_NAME="job-${JOB_ID}"
+
+# Record the job submission details (with file locking to prevent race conditions)
+(
+    flock -x 200
+    SUBMIT_TIME=$(date +"%Y-%m-%d %H:%M:%S")
+    echo "${JOB_ID},${SUBMIT_TIME},${SCRIPT}" >> "$JOB_RECORD_FILE"
+) 200>"$JOB_RECORD_FILE.lock"
+
+# Create a Kubernetes Headless Service to expose the master node
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Service
+metadata:
+  name: jobcomm-service
+  labels:
+   app: kbatch
+spec:
+  clusterIP: None
+  selector:
+    app: kbatch
+  ports:
+  - name: master-port
+    port: ${MASTER_PORT}
+    targetPort: ${MASTER_PORT}
+EOF
+
+# Modify the command to redirect output to the specified directory
+if [[ -n "$OUTPUT_DIR" ]]; then
+    # Ensure the output directory exists
+    mkdir -p "$OUTPUT_DIR"
+    
+    # Use JOB_ID and POD index to create unique log files for each pod
+    COMMAND="[\"/bin/bash\", \"-c\", \"/bin/bash $SCRIPT > $OUTPUT_DIR/${JOB_NAME}_\$(RANK).log 2>&1\"]"
+else
+    COMMAND="[\"/bin/bash\", \"$PWD/$SCRIPT\"]"
+fi
+
+# Create a Kubernetes Job YAML
+cat <<EOF | kubectl apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: $JOB_NAME
+spec:
+  backoffLimit: 0
+  parallelism: $NODES
+  completions: $NODES
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        job-name: $JOB_NAME
+        app: kbatch
+    spec:
+      subdomain: jobcomm-service
+      restartPolicy: Never
+      containers:
+      - name: job-container
+        image: $IMAGE_NAME
+        command: $COMMAND
+        workingDir: ${PWD}
+        resources:
+          limits:
+            nvidia.com/gpu: $GPUS_PER_NODE
+            cpu: $(( GPUS_PER_NODE * CPUS_PER_GPU ))
+            memory: $MEMORY_PER_NODE
+          requests:
+            nvidia.com/gpu: $GPUS_PER_NODE
+            cpu: $(( GPUS_PER_NODE * CPUS_PER_GPU ))
+            memory: $MEMORY_PER_NODE
+        env:
+        - name: MASTER_ADDR
+          value: "${JOB_NAME}-0.jobcomm-service.default.svc.cluster.local"
+        - name: MASTER_PORT
+          value: "${MASTER_PORT}"
+        - name: WORLD_SIZE
+          value: "${NODES}"
+        - name: RANK
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        volumeMounts:
+        - mountPath: $SHARED_VOLUME_PATH
+          name: shared_volume
+          readOnly: false
+        - name: custom-shm
+          mountPath: /dev/shm
+        ports:
+        - containerPort: ${MASTER_PORT}
+      volumes:
+      - name: shared_volume
+        hostPath:
+          path: $SHARED_VOLUME_PATH
+          type: Directory
+      - name: custom-shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: ${SHARED_MEM_PER_NODE} # Adjust the size as needed
+EOF
+
+echo "Job submitted: $JOB_NAME (Job ID: $JOB_ID)"

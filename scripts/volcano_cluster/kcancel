@@ -1,0 +1,40 @@
+#!/bin/bash
+
+# kcancel: Cancel a Volcano job by name or all jobs
+usage() {
+    echo "Usage: kcancel <job_name> | --all"
+    exit 1
+}
+
+# Check if no arguments are provided
+if [[ -z "$1" ]]; then
+    usage
+fi
+
+# Function to delete a single Volcano job
+delete_job() {
+    local JOB_NAME="$1"
+    kubectl delete vcjob "$JOB_NAME" 2>/dev/null
+    if [[ $? -eq 0 ]]; then
+        echo "Volcano Job '$JOB_NAME' cancelled successfully."
+    else
+        echo "Error: Volcano Job '$JOB_NAME' not found."
+    fi
+}
+
+# Function to delete all Volcano jobs
+delete_all_jobs() {
+    kubectl delete vcjob --all 2>/dev/null
+    if [[ $? -eq 0 ]]; then
+        echo "All Volcano jobs cancelled successfully."
+    else
+        echo "Error: No Volcano jobs found to delete."
+    fi
+}
+
+# Main logic
+if [[ "$1" == "--all" ]]; then
+    delete_all_jobs
+else
+    delete_job "$1"
+fi
