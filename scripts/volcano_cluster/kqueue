@@ -28,52 +28,42 @@ printf "%-10s %-10s %-10s %-10s %-10s %-10s\n" "JOBID" "STATE" "PODS" "CPUS" "ME
 completed_jobs=()
 failed_jobs=()
 
-# Iterate through each Volcano Job
-echo "$jobs" | jq -c '.items[]' | while IFS= read -r job; do
+# Write JSON data to a temporary file
+temp_file=$(mktemp)
+echo "$jobs" > "$temp_file"
+
+# Iterate through each Volcano Job from the temporary file
+while IFS= read -r job; do
     namespace=$(echo "$job" | jq -r '.metadata.namespace')
     name=$(echo "$job" | jq -r '.metadata.name')
 
     # Check the status of the Volcano Job
     state=$(echo "$job" | jq -r '.status.state.phase // "Unknown"')
-    pod_count=$(echo "$job" | jq -r '.status.running // 0')
-    succeeded=$(echo "$job" | jq -r '.status.succeeded // 0')
-    failed=$(echo "$job" | jq -r '.status.failed // 0')
 
     # If the Job is completed or failed, add it to the respective array for cleanup
     if [[ "$state" == "Completed" ]]; then
         completed_jobs+=("$namespace/$name")
-    elif [[ "$failed" -gt 0 ]]; then
+    elif [[ "$state" == "Failed" ]]; then
         failed_jobs+=("$namespace/$name")
     fi
 
     # Get resource requests from the Pods managed by this Volcano Job
     pods=$(kubectl get pods -n "$namespace" --selector=volcano.sh/job-name="$name" -o json)
+    pod_count=$(echo "$pods" | jq '.items | length')
     cpu_request="N/A"
     memory_request="N/A"
     gpu_request="0"
 
-    if [[ $(echo "$pods" | jq '.items | length') -gt 0 ]]; then
+    if [[ $pod_count -gt 0 ]]; then
         cpu_request=$(echo "$pods" | jq -r '.items[0].spec.containers[0].resources.requests.cpu // "N/A"')
         memory_request=$(echo "$pods" | jq -r '.items[0].spec.containers[0].resources.requests.memory // "N/A"')
         gpu_request=$(echo "$pods" | jq -r '.items[0].spec.containers[0].resources.requests."nvidia.com/gpu" // "0"')
     fi
 
-    # Determine the task state
-    if [[ "$pod_count" -eq 0 && "$state" != "Completed" && "$failed" -eq 0 ]]; then
-        state="Pending"
-    elif [[ "$state" == "Running" ]]; then
-        state="Running"
-    elif [[ "$state" == "Completed" ]]; then
-        state="Completed"
-    elif [[ "$failed" -gt 0 ]]; then
-        state="Failed"
-    else
-        state="Unknown"
-    fi
-
     # Display all jobs (including Completed and Failed)
     printf "%-10s %-10s %-10s %-10s %-10s %-10s\n" "$name" "$state" "$pod_count" "$cpu_request" "$memory_request" "$gpu_request"
-done
+
+done < <(jq -c '.items[]' "$temp_file")
 
 # Cleanup completed and failed jobs if --clean is specified
 if [[ "$CLEAN" == true ]]; then
@@ -84,7 +74,7 @@ if [[ "$CLEAN" == true ]]; then
         namespace=$(echo "$job" | cut -d'/' -f1)
         name=$(echo "$job" | cut -d'/' -f2)
         echo "Deleting completed Volcano Job: $name in namespace $namespace"
-        kubectl delete vcjob "$name" -n "$namespace" --ignore-not-found
+        kubectl delete vcjob "$name" -n "$namespace"
     done
 
     # Delete failed jobs
@@ -92,6 +82,9 @@ if [[ "$CLEAN" == true ]]; then
         namespace=$(echo "$job" | cut -d'/' -f1)
         name=$(echo "$job" | cut -d'/' -f2)
         echo "Deleting failed Volcano Job: $name in namespace $namespace"
-        kubectl delete vcjob "$name" -n "$namespace" --ignore-not-found
+        kubectl delete vcjob "$name" -n "$namespace"
     done
 fi
+
+# Clean up the temporary file
+rm -f "$temp_file"
